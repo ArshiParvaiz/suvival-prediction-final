@@ -1,0 +1,89 @@
+__author__ = 'marvinler'
+
+import torch.nn as nn
+import torch
+import os
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+from torchvision.models import AlexNet_Weights, alexnet, googlenet, GoogLeNet_Weights, densenet121, DenseNet121_Weights, resnet50, ResNet50_Weights, inception_v3, Inception_V3_Weights, vgg16, VGG16_Weights, shufflenet_v2_x0_5, ShuffleNet_V2_X0_5_Weights, squeezenet1_0, SqueezeNet1_0_Weights, resnet18, ResNet18_Weights, efficientnet_b0, EfficientNet_B0_Weights, efficientnet_b3, EfficientNet_B3_Weights
+alexnet_models_urls = alexnet(weights= AlexNet_Weights.IMAGENET1K_V1)
+densenet_models_urls =  densenet121(weights=DenseNet121_Weights.IMAGENET1K_V1)
+resnet50_models_urls = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+resnet18_models_urls = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+# resnet18_models_urls = resnet18()
+
+googlenet_models_urls = googlenet(weights=GoogLeNet_Weights.IMAGENET1K_V1)
+inception_models_urls = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1)
+vgg_models_urls = vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
+shufflenetv2_models_urls = shufflenet_v2_x0_5(weights=ShuffleNet_V2_X0_5_Weights.IMAGENET1K_V1)
+squeezenet_models_urls = squeezenet1_0(weights=SqueezeNet1_0_Weights.IMAGENET1K_V1)
+efficientnet_models_urls = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
+efficientnet3_models_urls = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
+
+
+
+ALL_AVAILABLE_MODELS = [alexnet_models_urls, densenet_models_urls, googlenet_models_urls, inception_models_urls,
+                          resnet50_models_urls, shufflenetv2_models_urls,
+                         squeezenet_models_urls, vgg_models_urls, resnet18_models_urls]
+
+
+def get_original_classifier(model_type, pretrained):
+
+    if model_type.lower() == 'resnet18':
+        resnet18_models_urls = resnet18().to(device)
+        return resnet18_models_urls
+    elif model_type.lower() == 'resnet50':
+        return resnet50_models_urls
+    elif model_type.lower() == 'vgg16':
+        return vgg_models_urls
+    elif model_type.lower() == 'efficientnetb0':
+        return efficientnet_models_urls
+    elif model_type.lower() == 'efficientnetb3':
+        return efficientnet3_models_urls
+
+
+def replace_last_layer(model, model_type, output_layer):
+    if 'resnet' in model_type or 'googlenet' in model_type or 'inception' in model_type or 'shufflenetv2' in model_type:
+        model.fc = nn.Linear(model.fc.in_features, output_layer, bias=True)
+    elif 'densenet' in model_type:
+        model.classifier = nn.Linear(model.classifier.in_features, output_layer, bias=True)
+    elif 'mnasnet' in model_type or 'mobilenet' in model_type:
+        model.classifier._modules['1'] = nn.Linear(model.classifier._modules['1'].in_features, output_layer, bias=True)
+    elif 'squeezenet' in model_type:
+        model.classifier._modules['1'] = nn.Conv2d(model.classifier._modules['1'].in_channels, output_layer, kernel_size=1)
+    elif 'vgg' in model_type:
+        model.classifier._modules['6'] = nn.Linear(model.classifier._modules['6'].in_features, output_layer, bias=True)
+    elif 'efficientnetb0' in model_type:
+        model.classifier = nn.Linear(model.classifier[1].in_features, output_layer, bias=True)
+    elif 'efficientnetb3' in model_type:
+        model.classifier = nn.Linear(model.classifier[1].in_features, output_layer, bias=True)
+    else:
+        raise ValueError('Unknow type %s' % model_type)
+    return model
+
+
+def instantiate_model(model_type, pretrained):
+    model = get_original_classifier(model_type, pretrained)
+    model = replace_last_layer(model, model_type, 224)
+    input_width = 224
+    return model, input_width
+
+def _load_pre_trained_weights(model):
+        try:
+            # checkpoints_folder = os.path.join('./pretrained_models', self.config['fine_tune_from'], 'checkpoints')
+            checkpoints_folder ='D:\\Arshi\\DESKTOP\\Survival-Prediction\\cod\\pretrained_models'
+            checkpoints_folder = os.path.join(checkpoints_folder, 'model.pth')
+            print(checkpoints_folder)
+            state_dict = torch.load(checkpoints_folder,map_location=device)
+            print(state_dict)
+            model.load_state_dict(state_dict,strict=False)
+            print("Loaded pre-trained model with success.")
+        except FileNotFoundError:
+            print("Pre-trained weights not found. Training from scratch.")
+
+        return model
+
+if __name__ == '__main__':
+    model = instantiate_model('resnet18', True, 1)
+    print(model)
+
+

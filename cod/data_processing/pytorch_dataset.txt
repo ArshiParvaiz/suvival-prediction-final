@@ -1,0 +1,185 @@
+__author__ = 'marvinler'
+
+import os
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import torch
+import torch.utils.data
+from torchvision import transforms
+from torchvision.utils import make_grid
+from PIL import Image
+import math
+import pandas as pd
+
+def pil_loader(path):
+    # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
+    with open(path, 'rb') as f:
+        img = Image.open(f)
+        return img.convert('RGB')
+
+
+class Dataset(torch.utils.data.dataset.Dataset):
+    def __init__(self, slides_folders, cases_folders, model_input_size, is_training, max_bag_size, logger, max_dataset_size=None,
+                 with_data_augmentation=True, seed=123, normalization_mean=None, normalization_std=None):
+        """
+        :param slides_folders: list of abs paths of slide folder (which should contains images, summary/label/percent
+            files
+        :param model_input_size: expected model input size (for cropping)
+        :param is_training: True if is training, else False (for data augmentation)
+        :param max_bag_size: maximum number of instances to be returned per bag
+        """
+
+        def verify_slide_folder_exists(slide_folder):
+            if not os.path.exists(slide_folder):
+                raise FileExistsError('parent dataset folder %s does not exist' % slide_folder)
+
+        list(map(verify_slide_folder_exists, slides_folders))
+        list(map(verify_slide_folder_exists, cases_folders))
+
+        self.slides_folders = np.asarray(slides_folders)
+        self.cases_folders = np.asarray(cases_folders)
+        self.model_input_size = model_input_size
+        self.max_bag_size = max_bag_size
+        self.max_dataset_size = max_dataset_size
+
+        self.is_training = is_training
+
+        self.logger = logger
+
+
+        self.cases_labels = []  # raw str labels
+        self.slides_summaries = []  # list of all initial tiles of slides
+        self.cases_slides_images_filepaths = []  # list of all in-dataset tilespaths of slides
+
+        self.with_data_augmentation = with_data_augmentation
+        normalization_mean = (0, 0, 0) if normalization_mean is None else normalization_mean
+        normalization_std = (1, 1, 1) if normalization_std is None else normalization_std
+        self.transform = self._define_data_transforms(normalization_mean, normalization_std)
+
+        self.seed = seed
+
+        cases_labels,  cases_ids, cases_time, clinical_data, cases_slides_images_filepaths = self.load_data()
+        self.cases_labels = cases_labels
+        self.cases_ids = cases_ids
+        self.cases_time = cases_time
+        self.cases_slides_images_filepaths = cases_slides_images_filepaths
+        self.clinical_data = clinical_data
+
+
+        self.retrieve_tiles_ids_with_images = False  # True will return bag of images and associated tiles ids
+
+    def _define_data_transforms(self, mean, std):
+        # if self.with_data_augmentation:
+        #     return transforms.Compose([
+        #         # transforms.RandomHorizontalFlip(),
+        #         # transforms.RandomVerticalFlip(),
+        #         transforms.ColorJitter(0.1, 0.1, 0.1, 0.01),
+        #         transforms.ToTensor(),
+        #         transforms.Normalize(mean, std),
+        #     ])
+        return transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
+
+    def load_data(self):
+        cases_labels, cases_ids, cases_time, clinical_data, cases_slides_images_filepaths = [], [], [], [], []
+        # Name of expected non-image files for all slides folders
+
+        label_filename = 'label.txt'
+        case_time_filename = 'case_time.txt'
+        case_id_filename = 'case_id.txt'
+
+        # Seek all slides folders, and load static data including list of tiles filepaths and bag label
+
+        # I should be doing it for cases
+        for i, case_folder in enumerate(tqdm(self.cases_folders)):
+            all_case_slides = list(filter(lambda f: os.path.isdir(os.path.join(case_folder, f)), os.listdir(case_folder)))
+            # case_folder = os.path.dirname(slide_folder)
+            if self.max_dataset_size is not None and i + 1 > self.max_dataset_size:
+                break
+            all_case_files = list(filter(lambda f: os.path.isfile(os.path.join(case_folder, f)), os.listdir(case_folder)))
+
+            # Seek and save label, case_id and summary files: expects 1 and only 1 for each
+            for data_filename in [label_filename, case_id_filename,case_time_filename]:
+                assert sum([f == data_filename for f in all_case_files]) == 1, 'slide %s: found %d files for %s, expected 1' % (case_folder, sum([f == data_filename for f in all_case_files], ), data_filename)
+
+            label_file = os.path.join(case_folder, [f for f in all_case_files if f == label_filename][0])
+            case_time_file = os.path.join(case_folder, [f for f in all_case_files if f == case_time_filename][0])
+            case_id_file = os.path.join(case_folder, [f for f in all_case_files if f == case_id_filename][0])
+
+            with open(label_file, 'r') as f:
+                case_label = int(f.read())
+            with open(case_time_file, 'r') as f:
+                case_time = f.read()
+            with open(case_id_file, 'r') as f:
+                case_id = f.read()
+
+            clinical = pd.read_csv(case_folder + "\\" + case_id + '.tsv',sep='\t', )
+            clinical = clinical[clinical.columns[0]].values.tolist()
+
+            clinical_data.append(clinical)
+            # Save data
+            cases_labels.append(case_label)
+            cases_time.append(case_time)
+            cases_ids.append(case_id)
+            cases_slides_images_filepaths.append(all_case_slides)
+        cases_labels = np.asarray(cases_labels)
+        cases_time = np.asarray(cases_time)
+        cases_ids = np.asarray(cases_ids)
+        return cases_labels, cases_ids,cases_time, clinical_data, cases_slides_images_filepaths
+
+
+    def show_bag(self, bag_idx, savefolder=None):
+        """ Plot/save tiles sampled from the slide of provided index """
+        bag = self._get_slide_instances(bag_idx)
+        bag_label = self.cases_labels[bag_idx]
+        bag_time = self.cases_time[bag_idx]
+        tr = transforms.ToTensor()
+        bag = [tr(b) for b in bag]
+        imgs = make_grid(bag)
+
+        npimgs = imgs.numpy()
+        plt.imshow(np.transpose(npimgs, (1, 2, 0)), interpolation='nearest')
+        plt.title('Bag label: %s | %d instances | %s time' % (bag_label, len(bag), bag_time))
+        if savefolder is not None:
+            plt.savefig(os.path.join(savefolder, 'show_' + str(bag_idx) + '.png'), dpi=1000)
+        else:
+            plt.show()
+
+    def _get_slide_instances(self, item):
+        """ Memory load all tiles or randomly sampled tiles from slide of specified index """
+        slide_images_filepaths = self.cases_slides_images_filepaths[item]
+        case_id = self.cases_ids[item]
+        # Randomly sample the specified max number of tiles from the slide with replacement
+        if self.max_bag_size is not None:
+            temp = []
+            total_slides = len(slide_images_filepaths)
+            # tiles_from_each_slide = self.max_bag_size
+            tiles_from_each_slide = math.floor(self.max_bag_size/total_slides)
+            remaining = self.max_bag_size - (total_slides*tiles_from_each_slide)
+            for i in  range(total_slides):
+                if i == total_slides - 1:
+                    tiles_from_each_slide = tiles_from_each_slide + remaining
+                slide_folder = os.path.join('D:\\GBM\\output_folder\\filtered_tiles\\224\\' + str(case_id),slide_images_filepaths[i]+ '\\slide_files')
+                # slide_folder = os.path.join('D:\\GBM\\output_folder\\filtered_tiles\\224\\' + str(case_id), slide_images_filepaths[0] + '\\slide_files')
+                slide_tiles = list(filter(lambda f: os.path.isfile(os.path.join(slide_folder, f)), os.listdir(slide_folder)))
+                slide_select_tiles = random.choices(slide_tiles, k=tiles_from_each_slide)
+                temp.append([os.path.join(slide_folder, tile) for tile in slide_select_tiles])
+            flat_list = [item for sublist in temp for item in sublist]
+            bag_images = [pil_loader(tile) for tile in flat_list]
+        return bag_images
+
+    def __getitem__(self, item):
+        if not self.retrieve_tiles_ids_with_images:
+            case_instances = self._get_slide_instances(item)
+            case_instances = torch.stack([self.transform(instance) for instance in case_instances])
+            case_label = self.cases_labels[item]
+            case_time = self.cases_time[item]
+            case_clinical = self.clinical_data[item]
+            case_id  = self.cases_ids[item]
+            return case_instances, case_label, case_time, case_clinical, case_id
+
+
+
+    def __len__(self):
+        return len(self.cases_labels)

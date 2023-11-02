@@ -1,0 +1,165 @@
+
+
+import os
+import argparse
+from time import gmtime, strftime
+
+from cod import get_logger
+from cod.data_processing import case_factory, svs_factory
+
+desired_magnification = 20
+desired_tile_width = 224
+desired_overlap = 0
+expected_tile_shape = (desired_tile_width, desired_tile_width, 3)
+
+background_threshold = .75
+background_pixel_value = 220
+
+train_size = .75
+val_size = .1
+test_size = 1. - train_size - val_size
+DATA_LOCATION = r'D:\GBM'
+assert test_size > 0
+
+
+def get_parser():
+    parser = argparse.ArgumentParser(description='Data processing module: handle slides download from The Cancer '
+                                                 'Genome Atlas platform, slides tiling, and background removal.')
+    parser.add_argument('output_folder', type=str, default=None, metavar='OUTPUT_FOLDER',
+                        help='folder containing resulting background-filtered tiles from downloaded or source slides')
+
+    parser.add_argument('--gdc-executable', type=str, default=None, metavar='GDC_EXE_FILEPATH',
+                        help='path of the gdc executable used in case of download from TCGA platform')
+    parser.add_argument('--manifest', type=str, default=None, metavar='MANIFEST_FILE',
+                        help='manifest file downloaded from the TCGA platform containing md5sums and co of the slides '
+                             'to be downloaded')
+
+    parser.add_argument('--no-download', action='store_true', default=False,
+                        help='specify that no download should be done from TCGA platform; in this case, seeks for any '
+                             'slides with openslide-supported format')
+    parser.add_argument('--source-slides-folder', type=str, default=None, metavar='GDC_EXE_FILEPATH',
+                        help='source folder containing slides to be processed when no TCGA download is performed')
+    return parser
+
+
+def main(output_folder, do_download, gdc_executable, manifest_filepath, source_slides_folder):
+    # logger = get_logger(filename_handler='code.data_processing.' + os.path.basename(__file__) +
+    #     #                                      '_' + strftime("%Y-%m-%d_%H:%M:%S", gmtime()) + '.log')
+    logger = get_logger(filename_handler='code.data_processing.' + os.path.basename(__file__) + '.log')
+
+    logger.info('Data_processing control parameters:')
+    logger.info('do_download: ' + str(do_download))
+    logger.info('gdc_executable: ' + str(gdc_executable))
+    logger.info('manifest_filepath: ' + str(manifest_filepath))
+    logger.info('source_slides_folder: ' + str(source_slides_folder))
+    logger.info('Meta-parameters:')
+    logger.info('desired_magnification %s' % str(desired_magnification))
+    logger.info('tile_width %s' % str(desired_tile_width))
+    logger.info('expected_tile_shape %s' % str(expected_tile_shape))
+    logger.info('background_threshold %s' % str(background_threshold))
+    logger.info('background_pixel_value %s' % str(background_pixel_value))
+
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    # Download SVS files using manifest and GDC extraction tool
+    if do_download:
+        if not os.path.exists(os.path.join(output_folder, 'has_been_downloaded')):
+            if manifest_filepath is None or gdc_executable is None:
+                raise ValueError('Download from TCGA is on: need both --gdc-executable and --manifest arguments filled')
+            if not os.path.exists(gdc_executable):
+                raise FileNotFoundError(f'Specified GDC executable {gdc_executable} not found')
+            if not os.path.exists(manifest_filepath):
+                raise FileNotFoundError(f'Specified manifest file {manifest_filepath} not found')
+
+            crude_slides_output_folder = os.path.join(output_folder, 'downloaded_slides')
+            if not os.path.exists(crude_slides_output_folder):
+                os.makedirs(crude_slides_output_folder)
+
+            logger.info(f'Downloading slides into {crude_slides_output_folder}...')
+            slides_filepaths, md5sums, cases_ids = svs_factory.download_svs_files(gdc_executable, manifest_filepath,
+                                                                                  crude_slides_output_folder)
+
+            # Write control file after download is finished
+            with open(os.path.join(output_folder, 'has_been_downloaded'), 'w') as f:
+                f.write('\n'.join(','.join(a) for a in zip(slides_filepaths, md5sums, cases_ids)))
+            logger.info('done')
+        else:
+            logger.info('Slides already downloaded -> skipping')
+            # Retrieve all downloaded SVS files in case previous step not performed
+            with open(os.path.join(output_folder, 'has_been_downloaded'), 'r') as f:
+                download_content = f.read().splitlines()
+            download_content = list(map(lambda line: line.split(','), download_content))
+            slides_filepaths, md5sums, cases_ids = list(map(list, zip(*download_content)))
+    else:
+        if source_slides_folder is None:
+            raise ValueError('No download from TCGA: need --source-slides-folder argument filled with folder '
+                             'containing slides to process')
+        elif not os.path.exists(source_slides_folder):
+            raise FileNotFoundError(f'Input folder {source_slides_folder} with slides to be processed not found')
+
+        logger.info(f'Performing no download from TCGA as requested; listing source slides from {source_slides_folder}')
+        slides_filepaths = svs_factory.list_slides_in_folder(source_slides_folder)
+        # if not slide filepaths retrieved, try regime where slides are inside sup-folders
+        if len(slides_filepaths) == 0:
+            slides_filepaths = svs_factory.list_slides_in_folder(source_slides_folder, with_supfolder=True)
+        cases_ids = ['no_case_id'] * len(slides_filepaths)
+
+
+    # Independently from previous processing, extract labels of SVS files
+    filtered_tiles_output_folder = os.path.join(output_folder, 'filtered_tiles')
+    filtered_tiles_output_folder = os.path.join(filtered_tiles_output_folder , '224')
+    has_been_filtered_filename = os.path.join(output_folder, 'has_been_moved_and_filtered')
+    has_been_filtered_cases = os.path.join(output_folder, 'has_been_moved_and_filtered_cases')
+    if not os.path.exists(os.path.join(output_folder, 'has_been_moved_and_filtered')):
+        output_tiles_folders = slides_filepaths
+        svs_filenames = list(map(os.path.basename, slides_filepaths))
+        logger.info('  done')
+
+        logger.info('Moving+background-filtering tiles into %s' % output_folder)
+        data_folders, data_case_folders = svs_factory.move_and_filter_tiles_folders(output_tiles_folders, svs_filenames, cases_ids,
+                                                                                    filtered_tiles_output_folder,
+                                                                                    background_pixel_value,
+                                                                                    background_threshold, expected_tile_shape,
+                                                                                    logger, desired_tile_width,
+                                                                                    desired_overlap, desired_magnification)
+        logger.info('  done')
+
+        open(has_been_filtered_filename, 'w').write('\n'.join(data_folders))
+        open(has_been_filtered_cases, 'w').write('\n'.join(data_case_folders))
+        logger.info('Wrote `has_been_moved_and_filtered` file')
+    else:
+        logger.info('Tiles already moved and filtered -> skipping')
+        # seek classes folders
+        # data_folders = [f for f in os.listdir(filtered_tiles_output_folder)
+        #                 if not os.path.isfile(os.path.join(filtered_tiles_output_folder, f))]
+        data_folders = open(has_been_filtered_filename, 'r').read().splitlines()
+        data_case_folders = open(has_been_filtered_cases, 'r').read().splitlines()
+        logger.info('Found %d source slides folders in %s' % (len(data_folders), filtered_tiles_output_folder))
+
+        logger.info('Performing train/val/test splitting with background removal')
+        # train_cases_ids, val_cases_ids, test_cases_ids = case_factory.split_svs_samples_casewise(output_tiles_folders,
+        #                                                                                          cases_ids,
+        #                                                                                          train_size,
+        #                                                                                          val_size,
+        #                                                                                          test_size)
+
+    logger.info('Pre-processing done')
+    return list(map(lambda f: os.path.join(output_folder, f), data_folders)), list(map(lambda f: os.path.join(output_folder, f), data_case_folders))
+
+
+if __name__ == '__main__':
+    # parser = get_parser()
+    # args = parser.parse_args()
+
+    output_folder = "D:\\GBM\\output_folder"
+    gdc_executable = 'D:\\Arshi\\DOWNLOADS\\gdc\\gdc-client.exe'
+    manifest_filepath = 'D:\\GBM\\manifest.txt'
+    do_download = True
+    source_slides_folder = 'D:\\GBM',
+    main(output_folder, do_download, gdc_executable, manifest_filepath, source_slides_folder)
+
+
+
+
+

@@ -1,0 +1,47 @@
+import torch
+from torch.utils.data import BatchSampler
+import random
+
+class MyBatchSampler(BatchSampler):
+    def __init__(self, data_source, batch_size, shuffle=True):
+        # super(MyBatchSampler, self).__init__(data_source, batch_size, drop_last=False)
+        self.shuffle = shuffle
+        self.data_source = data_source
+        self.check = 0
+        self.batch_size = batch_size
+        self.drop_last = False
+
+    def __iter__(self):
+        if self.shuffle:
+            indices = torch.randperm(len(self.data_source)).tolist()
+        else:
+            indices = list(range(len(self.data_source)))
+        batch = []
+        for idx in indices:
+            case_instances, case_label, case_time,  case_clinical, case_id= self.data_source[idx]
+            if case_label == 1:
+                self.check = 1
+            if len(batch) == self.batch_size-1 and  self.check == 0:
+                for i in range(len(indices)):
+                    l = random.choice(indices)
+                    print(l)
+                    case_instances, case_label, case_time, case_clinical, case_id = self.data_source[l]
+                    if case_label == 1:
+                        batch.append(l)
+                        break
+            else:
+                batch.append(idx)
+            if len(batch) == self.batch_size:
+                self.check = 0
+                return_batch = batch
+                batch = []
+                yield return_batch
+
+
+
+    def __len__(self):
+        # print('i am here')
+        if self.drop_last:
+            return len(self.data_source) // self.batch_size
+        else:
+            return (len(self.data_source) + self.batch_size - 1) // self.batch_size

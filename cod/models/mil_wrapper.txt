@@ -1,0 +1,331 @@
+__author__ = 'marvinler'
+
+import torch
+from torch import nn as nn
+import numpy as np
+from sklearn.utils import check_consistent_length, check_array
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# device = torch.device("cpu")
+input_size = 224
+hidden_size1 = 128
+patches = 21
+class MaxMinMIL(nn.Module):
+    def __init__(self, classifier_model):
+        super().__init__()
+        self.instance_model = classifier_model
+
+        self.flatten = nn.Flatten(0)
+        self.flatten = self.flatten.to(device)
+
+        self.g1 = nn.Linear(patches *input_size, 128)
+        self.g1 = self.g1.to(device)
+
+        self.relu1 = nn.ReLU()
+        self.relu1 = self.relu1.to(device)
+
+        self.g2 = nn.Linear(hidden_size1, patches)
+        self.g2 = self.g2.to(device)
+
+        self.fc1 = nn.Linear(input_size, hidden_size1)
+        self.fc1 = self.fc1.to(device)
+
+        self.relu = nn.ReLU()
+        self.relu = self.relu.to(device)
+
+        self.fc2 = nn.Linear(hidden_size1, 1)
+        self.fc2 = self.fc2.to(device)
+
+        self.sig = nn.Sigmoid()
+        self.sig = self.sig.to(device)
+
+        # self.multihead_attention = nn.MultiheadAttention(embed_dim=input_size, num_heads=1)
+
+
+
+    def MLP(self, x):
+        x = self.relu(x)
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+        # x = self.sig(x)
+        # x = self.relu(x)
+        return x
+
+    def Generate_weights(self, x):
+        x = self.flatten(x)
+        x = self.g1(x)
+        x = self.relu1(x)
+        x = self.g2(x)
+        x = self.sig(x)
+        return x
+
+
+    def forward(self, instances):
+        patients_wise_predictions = torch.empty((instances.shape[0]))
+        patients_wise_predictions = patients_wise_predictions.to(device)
+        for i in range(instances.shape[0]):
+            instances_features = self.instance_model(instances[i])
+            instances_features = torch.mean(instances_features, dim=0)
+            patient_wise_prediction = self.MLP(instances_features)
+            patients_wise_predictions[i] = patient_wise_prediction
+            # weights = self.Generate_weights(instances_features)
+            # weighted_instances_features = weights.view(patches, 1)*instances_features
+            # weighted_sum = torch.sum(weighted_instances_features, dim=0)
+            # patient_wise_prediction = self.MLP(weighted_sum)
+            # patients_wise_predictions[i] = patient_wise_prediction
+            # instances_features, _ = self.multihead_attention(instances_features, instances_features, instances_features)
+        return patients_wise_predictions
+
+    def loss(self, predictions, labels, cases_times):
+        """
+        Computes instance-wise error signal with self.loss_function using instances predictions and computed
+        proxy-labels, and use the input mask for averaging.
+        :param predictions: tensor of instances predictions
+        :param computed_instances_labels: tensor of computed proxy-labels, same shape
+        :param mask_instances_labels: tensor of same shape than computed_instances_labels containing 1 if associated
+        instance has an assigned proxy label, 0 otherwise
+        :return: batch-averaged loss signal
+        """
+        # loss = self.neg_par_log_likelihood(predictions, labels, case_time)
+        loss = self.neg_par_log_likelihood(predictions, cases_times, labels)
+        # self.my(predictions, case_time, labels)
+
+        return loss
+
+    def R_set(self, x):
+        '''Create an indicator matrix of risk sets, where T_j >= T_i.
+        Note that the input data have been sorted in descending order.
+        Input:
+            x: a PyTorch tensor that the number of rows is equal to the number of samples.
+        Output:
+            indicator_matrix: an indicator matrix (which is a lower traiangular portions of matrix).
+        '''
+        n_sample = x.size(0)
+        matrix_ones = torch.ones(n_sample, n_sample)
+        indicator_matrix = torch.tril(matrix_ones)
+
+        return (indicator_matrix)
+
+    def neg_par_log_likelihood(self, pred, ytime, yevent):
+        """
+        Based on https://github.com/tomcat123a/survival_loss_criteria/blob/master/loss_function_criteria.py
+        """
+        ytime_sorted, idx = torch.sort(ytime, dim=-1, descending=True)
+        yevent_sorted = torch.gather(yevent, -1, idx)
+        pred_sorted = torch.gather(pred.view(-1), -1, idx)
+        pred_sorted = pred_sorted.view(-1, 1)
+        n_observed = int(yevent_sorted.sum(0))
+        ytime_indicator = self.R_set(ytime_sorted)
+        if torch.cuda.is_available():
+            ytime_indicator = ytime_indicator.cuda()
+        risk_set_sum = ytime_indicator.mm(torch.exp(pred_sorted))
+        diff = pred_sorted - torch.log(risk_set_sum)
+        yevent_sorted = yevent_sorted.float()
+        sum_diff_in_observed = torch.transpose(diff, 0, 1).mm(yevent_sorted.view(-1, 1))
+        loss = (- (sum_diff_in_observed / n_observed)).reshape((-1,))
+
+        return loss
+
+    def my(self, predictions, times, events):  # event=0,censored
+        # ytime should be sorted with increasing order
+        '''Calculate the average Cox negative partial log-likelihood.
+        Input:
+            pred: linear predictors from trained model.
+            ytime: true survival time from load_data().
+            yevent: true censoring status from load_data().
+        Output:
+            cost: the cost that is to be minimized.
+        '''
+        loss = 0.0
+
+        # Sort the event times and predictions in ascending order
+        sorted_indices = torch.argsort(times)
+        sorted_events = events[sorted_indices]
+        sorted_predictions = predictions[sorted_indices]
+        n_observed = sorted_events.sum(0)
+        # Calculate the partial likelihood for each event
+        for i, event in enumerate(sorted_events):
+            if event ==1:
+                # Select the predictions at or after the event time
+                individuals_at_risk = sorted_predictions[i:]
+
+                # Calculate the hazard term
+                hazard_term = torch.exp(individuals_at_risk)
+
+                # Sum of hazard terms
+                sum_hazard_terms = torch.sum(hazard_term)
+
+                # Update the loss
+                loss += individuals_at_risk[0] - torch.log(sum_hazard_terms)
+        # Take the negative average of the loss
+        # return  - (loss / n_observed)
+        print(-(loss / n_observed))
+
+
+    def _check_estimate(self, estimate, test_time):
+        """
+        Based on https://github.com/sebp/scikit-survival
+        """
+        estimate = check_array(estimate, ensure_2d=False)
+        if estimate.ndim != 1:
+            raise ValueError(
+                'Expected 1D array, got {:d}D array instead:\narray={}.\n'.format(
+                    estimate.ndim, estimate))
+        check_consistent_length(test_time, estimate)
+        return estimate
+
+    def _check_inputs(self,event_indicator, event_time, estimate):
+        """
+        Based on https://github.com/sebp/scikit-survival
+        """
+        check_consistent_length(event_indicator, event_time, estimate)
+        event_indicator = check_array(event_indicator, ensure_2d=False)
+        event_time = check_array(event_time, ensure_2d=False)
+        estimate = self._check_estimate(estimate, event_time)
+
+        if not np.issubdtype(event_indicator.dtype, np.bool_):
+            raise ValueError(
+                'only boolean arrays are supported as class labels for survival analysis, got {0}'.format(
+                    event_indicator.dtype))
+
+        if len(event_time) < 2:
+            raise ValueError("Need a minimum of two samples")
+
+        if not event_indicator.any():
+            raise ValueError("All samples are censored")
+
+        return event_indicator, event_time, estimate
+
+    def _get_comparable(self,event_indicator, event_time):
+        """
+        Based on https://github.com/sebp/scikit-survival
+        """
+        order = np.argsort(event_time)
+        n_samples = len(event_time)
+        tied_time = 0
+        comparable = {}
+        i = 0
+        while i < n_samples - 1:
+            time_i = event_time[order[i]]
+            start = i + 1
+            end = start
+            while end < n_samples and event_time[order[end]] == time_i:
+                end += 1
+
+            # check for tied event times
+            event_at_same_time = event_indicator[order[i:end]]
+            censored_at_same_time = ~event_at_same_time
+            for j in range(i, end):
+                if event_indicator[order[j]]:
+                    mask = np.zeros(n_samples, dtype=bool)
+                    mask[end:] = True
+                    # an event is comparable to censored samples at same time point
+                    mask[i:end] = censored_at_same_time
+                    comparable[j] = mask
+                    tied_time += censored_at_same_time.sum()
+            i = end
+
+        return comparable, tied_time
+
+    def _estimate_concordance_index(self,event_indicator, event_time, estimate, tied_tol=1e-8):
+        """
+        Based on https://github.com/sebp/scikit-survival
+        """
+        weights = np.ones_like(estimate)
+        order = np.argsort(event_time)
+        comparable, tied_time = self._get_comparable(event_indicator, event_time)
+
+        concordant = 0
+        discordant = 0
+        tied_risk = 0
+        numerator = 0.0
+        denominator = 0.0
+        for ind, mask in comparable.items():
+            est_i = estimate[order[ind]]
+            event_i = event_indicator[order[ind]]
+            w_i = weights[order[ind]]
+
+            est = estimate[order[mask]]
+
+            assert event_i, 'got censored sample at index %d, but expected uncensored' % order[ind]
+
+            ties = np.absolute(est - est_i) <= tied_tol
+            n_ties = ties.sum()
+            # an event should have a higher score
+            con = est < est_i
+            n_con = con[~ties].sum()
+
+            numerator += w_i * n_con + 0.5 * w_i * n_ties
+            denominator += w_i * mask.sum()
+
+            tied_risk += n_ties
+            concordant += n_con
+            discordant += est.size - n_con - n_ties
+
+        if denominator == 0:
+            cindex = np.inf
+        else:
+            cindex = numerator / denominator
+        return cindex, concordant, discordant, tied_risk, tied_time, numerator, denominator
+
+    def concordance_index_censored(self, event_indicator, event_time, estimate, tied_tol=1e-8):
+        """
+        Based on https://github.com/sebp/scikit-survival
+        Concordance index for right-censored data
+        The concordance index is defined as the proportion of all comparable pairs
+        in which the predictions and outcomes are concordant.
+        Samples are comparable if for at least one of them an event occurred.
+        If the estimated risk is larger for the sample with a higher time of
+        event/censoring, the predictions of that pair are said to be concordant.
+        If an event occurred for one sample and the other is known to be
+        event-free at least until the time of event of the first, the second
+        sample is assumed to *outlive* the first.
+        When predicted risks are identical for a pair, 0.5 rather than 1 is added
+        to the count of concordant pairs.
+        A pair is not comparable if an event occurred for both of them at the same
+        time or an event occurred for one of them but the time of censoring is
+        smaller than the time of event of the first one.
+        See [1]_ for further description.
+        Parameters
+        ----------
+        event_indicator : array-like, shape = (n_samples,)
+            Boolean array denotes whether an event occurred --> can take torch.tensor with 0 and 1
+        event_time : array-like, shape = (n_samples,)
+            Array containing the time of an event or time of censoring --> can take torch.tensor
+        estimate : array-like, shape = (n_samples,)
+            Estimated risk of experiencing an event --> can take torch.tensor
+        tied_tol : float, optional, default: 1e-8
+            The tolerance value for considering ties.
+            If the absolute difference between risk scores is smaller
+            or equal than `tied_tol`, risk scores are considered tied.
+        Returns
+        -------
+        cindex : float
+            Concordance index
+        concordant : int
+            Number of concordant pairs
+        discordant : int
+            Number of discordant pairs
+        tied_risk : int
+            Number of pairs having tied estimated risks
+        tied_time : int
+            Number of comparable pairs sharing the same time
+        numerator : int
+        denominator : int
+
+        References
+        ----------
+        .. [1] Harrell, F.E., Califf, R.M., Pryor, D.B., Lee, K.L., Rosati, R.A,
+               "Multivariable prognostic models: issues in developing models,
+               evaluating assumptions and adequacy, and measuring and reducing errors",
+               Statistics in Medicine, 15(4), 361-87, 1996.
+        """
+
+        event_indicator = np.array([bool(i) for i in event_indicator.cpu().numpy()])
+        event_time = event_time.cpu().numpy()
+        estimate = estimate.cpu().detach().view(-1).numpy()
+        event_indicator, event_time, estimate = self._check_inputs(
+            event_indicator, event_time, estimate)
+
+        return self._estimate_concordance_index(event_indicator, event_time, estimate, tied_tol)
+
